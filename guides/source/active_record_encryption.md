@@ -81,6 +81,18 @@ bytes for the [salt](https://en.wikipedia.org/wiki/Salt_(cryptography)).
 Once the keys are generated and stored, you can start using Active Record
 Encryption by declaring attributes to be encrypted in the model.
 
+### Define Database Columns
+
+The encrypted attributes must be backed by a database column. By default, this
+column should be of type `string` or `text`. If you use a binary message
+serializer (like [`MessagePackMessageSerializer`](https://api.rubyonrails.org/classes/ActiveRecord/Encryption/MessagePackMessageSerializer.html)), you must use a `binary`
+column instead.
+
+Since an encrypted payload is usually a string (binary data serialized with
+Base64) or raw binary data, you cannot store encrypted payloads in columns with
+strict types like `integer`, `date`, or `datetime`. The encrypted data format
+will not match these column type requirements.
+
 ### Declare Encrypted Attributes
 
 The [`encrypts`
@@ -146,11 +158,9 @@ like UTF-8, a single character can take up to four bytes. This means that a
 column defined to hold N characters may actually consume up to 4 × N bytes in
 storage.
 
-Since an encrypted payload is binary data serialized with Base64, it can be
-stored in regular a `string` column. Because it's a sequence of ASCII bytes, an
-encrypted column can take up to four times its clear version size. So, even if
-the bytes stored in the database are the same, the column must be four times
-bigger.
+Because the payload is a sequence of ASCII bytes, an encrypted column can take
+up to four times its clear version size. So, even if the bytes stored in the
+database are the same, the column must be four times bigger.
 
 In practice, this means:
 
@@ -276,22 +286,31 @@ With the `:ignore_case` option, you need to add a new column named
 When reading the `name` attribute, Rails will serve the version with the
 original case. When querying `name`, it will ignore case.
 
-### Serialized Attributes
+### Typed and Serialized Attributes
 
-By default, Active Record Encryption will serialize values using the underlying
-type before encrypting them as long as the value is serializable as Strings. If
-the underlying type is not serializable as a String, you can use a custom
-[`message_serializer`](https://edgeapi.rubyonrails.org/classes/ActiveRecord/Encryption/MessageSerializer.html):
+By default, encrypted attributes are decrypted as strings. If you want the
+attribute to be a specific type (like a `date`, `datetime`, `integer`,
+or `boolean`), you must configure the type casting using the
+[`attribute`](https://api.rubyonrails.org/classes/ActiveRecord/Attributes/ClassMethods.html#method-i-attribute)
+method.
+
+WARNING: You must define the `attribute` **before** calling `encrypts`.
 
 ```ruby
-class Article < ApplicationRecord
-  encrypts :metadata, message_serializer: SomeCustomMessageSerializer.new
+class User < ApplicationRecord
+  # CORRECT: Declare the type first
+  attribute :date_of_birth, :date
+  encrypts :date_of_birth
 end
 ```
 
+If you reverse the order, the `attribute` declaration may overwrite the
+encryption setup, causing data to be saved as plain text or preventing correct
+decryption.
+
 Attributes with structured types using the
-[`serialized`](https://api.rubyonrails.org/v8.0.2/classes/ActiveRecord/AttributeMethods/Serialization/ClassMethods.html#method-i-serialize)
-method can be encrypted as well. The `serialized` method is used when you have
+[`serialize`](https://api.rubyonrails.org/v8.0.2/classes/ActiveRecord/AttributeMethods/Serialization/ClassMethods.html#method-i-serialize)
+method can be encrypted as well. The `serialize` method is used when you have
 an attribute that needs to be saved to the database as a serialized object
 (using `YAML`, `JSON` or such), and retrieved by deserializing into the same
 object.
@@ -300,18 +319,16 @@ WARNING: When using serialized attributes for custom types, the declaration of
 the serialized attribute should go **before** the encryption declaration:
 
 ```ruby
-# CORRECT
-class Article < ApplicationRecord
-  serialize :title, type: Title
-  encrypts :title
-end
-
-# INCORRECT
-class Article < ApplicationRecord
-  encrypts :title
-  serialize :title, type: Title
+class User < ApplicationRecord
+  # CORRECT: Declare the serializer first
+  serialize :virtual_card_data, coder: JSON
+  encrypts :virtual_card_data
 end
 ```
+
+If you reverse the order, the `serialize` declaration may overwrite the
+encryption setup, causing data to be saved as plain text or preventing correct
+decryption.
 
 ### Ensuring Uniqueness with Encrypted Data
 
@@ -629,15 +646,37 @@ The main components of encryption contexts are:
   and the serialization by `message_serializer`.
 * `cipher`: the encryption algorithm itself (AES 256 GCM).
 * `key_provider`: serves encryption and decryption keys.
-* `message_serializer`: serializes and deserializes encrypted payloads.
+* `message_serializer`: serializes and deserializes the encrypted message
+  (ciphertext plus metadata) so it can be stored in a string column. This is
+  internal to the encryption pipeline—it is not the same as ActiveRecord's
+  `serialize`, which serializes your application-level attribute values.
 
-WARNING: If you decide to build your own `message_serializer`, it's important to
-use safe mechanisms that can't deserialize arbitrary objects. A commonly
-supported scenario is encrypting existing unencrypted data. An attacker can
-leverage this to enter a tampered payload before encryption takes place and
-perform RCE attacks. This means custom serializers should avoid `Marshal`,
-`YAML.load` (use `YAML.safe_load`  instead), or `JSON.load` (use `JSON.parse`
-instead).
+### Custom Message Serializers
+
+The default `message_serializer` converts encrypted messages to and from a
+string format for the database. You might override it for interoperability with
+another system or when migrating from a custom storage format. You can set it
+globally or per attribute.
+
+For example, the built-in `MessagePackMessageSerializer` serializes the
+encrypted payload to a binary format (MessagePack). This is more efficient
+than the default text-based format but requires a binary column in the database:
+
+```ruby
+# Per attribute (e.g. for a binary column storing biometric data):
+class User < ApplicationRecord
+  encrypts :biometric_data, message_serializer: ActiveRecord::Encryption::MessagePackMessageSerializer.new
+end
+
+# Or globally in config:
+# config.active_record.encryption.message_serializer = ActiveRecord::Encryption::MessagePackMessageSerializer.new
+```
+
+WARNING: If you build a custom `message_serializer`, use only safe mechanisms
+that cannot deserialize arbitrary objects. A common scenario is encrypting
+existing unencrypted data; an attacker can supply a tampered payload before
+encryption and achieve remote code execution. Avoid `Marshal`, `YAML.load`
+(use `YAML.safe_load` instead), and `JSON.load` (use `JSON.parse` instead).
 
 ### Built-In Encryption Context
 
